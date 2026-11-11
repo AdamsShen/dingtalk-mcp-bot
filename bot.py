@@ -10,7 +10,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import ssl
 import sys
 
@@ -20,6 +19,7 @@ from dingtalk_stream import AckMessage, ChatbotHandler, ChatbotMessage
 from config import Settings, load_settings
 from mcp_client import McpGatewayError, McpStdioClient
 from ops_actions import OpsDispatcher, OpsRouter
+from search_flow import SearchFlow, extract_env
 
 logger = logging.getLogger("dingtalk-mcp-bot")
 
@@ -27,6 +27,10 @@ HELP_TEXT = """**mcp-gateway 机器人使用说明**
 
 - `/search <关键词>`　语义检索接口方法（最常用）
 - `/search <关键词> env=test`　切到测试环境（默认 env=product）
+- 检索后回复 **第N条**　选定方法并提示补参数、指定环境
+- 检索后回复 **换一组**　换一批没展示过的候选方法
+- 给参数：`uid=586218703 env=test`，随后回复 **确认** 执行只读调用
+- 回复 **取消**　结束本次检索流程
 - `/tools`　列出 mcp-gateway 暴露的工具
 - `/call <工具名> {json参数}`　直接调用某个工具
 - `/ops list`　列出线上运营快捷操作（一键认证 / 改手机号 / 强制注销）
@@ -36,10 +40,8 @@ HELP_TEXT = """**mcp-gateway 机器人使用说明**
 
 也可以省掉 `/search`，直接 @机器人 说「修改用户昵称」这类业务话术；
 或说「给 uid 123 主播认证」这类话术触发 ops 快捷操作。
-写操作（invoke_rpc）默认关闭，需要网关侧 confirm_token 的流程请走 IDE。"""
-
-
-_ENV_PATTERN = re.compile(r"(?:^|\s)(?:--env[=\s]+|env=)(test|product)(?=\s|$)", re.IGNORECASE)
+写操作（invoke_rpc）默认关闭，且写方法一律不自动执行，需要网关侧
+confirm_token 的流程请走 IDE。"""
 
 
 def _ensure_tls_ca() -> None:
@@ -61,14 +63,6 @@ def _ensure_tls_ca() -> None:
     os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
 
-def _extract_env(text: str, default: str) -> tuple[str, str]:
-    match = _ENV_PATTERN.search(text)
-    if not match:
-        return default, text
-    cleaned = (text[: match.start()] + " " + text[match.end() :]).strip()
-    return match.group(1).lower(), cleaned
-
-
 def _message_text(message: ChatbotMessage) -> str:
     content = ""
     if message.text is not None and message.text.content:
@@ -83,35 +77,6 @@ def _message_text(message: ChatbotMessage) -> str:
 
 def _code_block(text: str, lang: str = "json") -> str:
     return f"```{lang}\n{text}\n```"
-
-
-def _render_search(query: str, env: str, raw: str) -> str:
-    try:
-        data = json.loads(raw)
-    except (TypeError, ValueError):
-        return f"**检索：{query}**（env=`{env}`）\n\n{_code_block(raw, 'text')}"
-
-    if isinstance(data, dict) and data.get("ok") is False:
-        return f"检索失败：{data.get('error') or data}"
-
-    results = (data.get("results") if isinstance(data, dict) else None) or []
-    lines = [f"**检索：{query}**　env=`{env}`　命中 {len(results)} 条"]
-    for index, item in enumerate(results, 1):
-        iface = str(item.get("iface") or "")
-        method = str(item.get("method") or "")
-        lines.append(
-            f"{index}. `{iface.rsplit('.', 1)[-1]}#{method}`　[{item.get('danger_level') or '-'}]"
-        )
-        lines.append(
-            f"　　app=`{item.get('application')}`　artifact=`{item.get('artifact_id')}`"
-        )
-        if item.get("param_fields"):
-            lines.append(f"　　参数：{item['param_fields']}")
-    if not results:
-        lines.append("没有命中，换成接口名 / 方法名 / 字段名再试一次。")
-    else:
-        lines.append("\n下一步可用 `/call describe_method {...}` 看签名与路由。")
-    return "\n".join(lines)
 
 
 class GatewayConnection:
@@ -147,11 +112,18 @@ class GatewayConnection:
 
 
 class GatewayBotHandler(ChatbotHandler):
-    def __init__(self, settings: Settings, connection: GatewayConnection, ops: OpsRouter) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        connection: GatewayConnection,
+        ops: OpsRouter,
+        search_flow: SearchFlow,
+    ) -> None:
         super().__init__()
         self.settings = settings
         self.connection = connection
         self.ops = ops
+        self.search_flow = search_flow
 
     async def process(self, callback: dingtalk_stream.CallbackMessage):
         message = ChatbotMessage.from_dict(callback.data)
@@ -181,6 +153,12 @@ class GatewayBotHandler(ChatbotHandler):
         if not text or text.lower() in {"help", "/help", "帮助", "?", "？"}:
             return HELP_TEXT
 
+        # 检索流程已生成请求体预览时，确认词必须归它，否则会被 ops 的待定计划抢走
+        if self.search_flow.wants_confirm(text, message):
+            reply = await self.search_flow.maybe_handle(text, message)
+            if reply is not None:
+                return reply
+
         # ops 快捷操作优先（含 plan → 二次确认 → run 的多轮状态）
         outcome = await self.ops.maybe_handle(text, message)
         if outcome.reply is not None:
@@ -188,23 +166,32 @@ class GatewayBotHandler(ChatbotHandler):
         # ops 命中但走不通（如参数不全）：回退全局检索，并把提示前置
         fallback_hint = outcome.fallback_hint
 
-        env, text = _extract_env(text, self.settings.default_env)
-
-        lowered = text.lower()
-        if lowered in {"/tools", "tools"} or text in {"工具", "工具列表"}:
+        # 显式指令优先，避免「/search xxx env=test」被多轮流程当成补参数误接管
+        raw_text = text
+        if raw_text.lower() in {"/tools", "tools"} or raw_text in {"工具", "工具列表"}:
             return await self._render_tools()
 
+        env, text, env_explicit = extract_env(raw_text, self.settings.default_env)
+        lowered = text.lower()
         if lowered.startswith("/search"):
             query = text[len("/search") :].strip()
             if not query:
                 return "用法：`/search <关键词>`，例如 `/search 修改用户昵称`"
-            return await self._search(query, env)
+            return await self._search(query, env, message, env_explicit)
 
         if lowered.startswith("/call"):
             return await self._call(text[len("/call") :].strip(), env)
 
-        # 没写指令：当成检索词
-        reply = await self._search(text, env)
+        # 检索多轮流程：第N条 / 换一组 / 补参数 / 确认 / 取消。
+        # 传原始文本，让流程自己解析中文环境词，否则「测试」会被提前剥掉。
+        flow_reply = await self.search_flow.maybe_handle(
+            raw_text, message, allow_params=fallback_hint is None
+        )
+        if flow_reply is not None:
+            return flow_reply
+
+        # 没写指令：当成检索词，同时建立一轮可继续追问的检索会话
+        reply = await self._search(text, env, message, env_explicit)
         if fallback_hint:
             reply = f"{fallback_hint}\n\n---\n{reply}"
         return reply
@@ -225,15 +212,9 @@ class GatewayBotHandler(ChatbotHandler):
         lines.append(f"\n机器人已开放：{opened}")
         return "\n".join(lines)
 
-    async def _search(self, query: str, env: str) -> str:
-        client = await self.connection.client()
-        raw, is_error = await client.call_tool(
-            "search_api",
-            {"env": env, "query": query, "limit": self.settings.search_limit},
-        )
-        if is_error:
-            return f"**检索失败**（env=`{env}`）\n\n{_code_block(raw, 'text')}"
-        return _render_search(query, env, raw)
+    async def _search(self, query: str, env: str, message, env_explicit: bool) -> str:
+        """发起一轮检索并交给他会话流程托管，后续可继续选第 N 条或换一组。"""
+        return await self.search_flow.begin_search(query, env, message, env_explicit)
 
     async def _call(self, rest: str, env: str) -> str:
         if not rest:
@@ -294,7 +275,8 @@ def main() -> int:
     ops_router = OpsRouter(dispatcher, allowed or None)
 
     connection = GatewayConnection(settings)
-    handler = GatewayBotHandler(settings, connection, ops_router)
+    search_flow = SearchFlow(settings, connection.client)
+    handler = GatewayBotHandler(settings, connection, ops_router, search_flow)
 
     credential = dingtalk_stream.Credential(settings.client_id, settings.client_secret)
     client = dingtalk_stream.DingTalkStreamClient(credential)
