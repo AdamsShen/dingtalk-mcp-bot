@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from config import Settings
-from mcp_client import McpStdioClient
+from mcp_client import McpGatewayError, McpStdioClient
 
 logger = logging.getLogger("dingtalk-mcp-bot.search")
 
@@ -68,21 +68,25 @@ _SEP_RE = re.compile(r"[，,；;、\s]+")
 
 
 def _looks_like_params(text: str) -> bool:
-    """判断一条消息是否在补请求参数。
+    """判断一条消息是否在补请求参数，而不是新的检索需求。
 
-    用户常见写法有三种：``uid=1``、``线上环境``（只补环境）、``599602175 查询``
-    （位置参数）。只要是这几种就应留在当前会话里，不能被当成新的检索词——
-    否则会话会被重建，用户前面给的参数全部丢失。
+    做法是把参数噪音全部剥掉（环境词、``k=v``、数字、「环境」、标点），
+    看是否还剩业务描述：
+    - ``线上环境`` / ``599602175`` / ``uid=1 env=test`` → 剥完为空，是补参数；
+    - ``579296411 线上环境，修改主播昵称`` → 还剩「修改主播昵称」，是新需求。
+
+    之前只看「含不含环境词」，导致带着环境的新需求被当成补参数，
+    会话卡在等待参数上（群里 17:59 就是这个现象）。
     """
     candidate = (text or "").strip()
     if not candidate:
         return False
-    if "=" in candidate:
-        return True
-    if _parse_env(candidate):
-        return True
-    # 纯数字（可带中文标点分隔）视为可能的 uid / roomId 等位置参数
-    return bool(re.fullmatch(r"[\d，,；;、\s]+", candidate))
+    candidate = _strip_env_words(candidate)          # 去「线上 / 测试」等
+    candidate = _KV_RE.sub(" ", candidate)           # 去 k=v
+    candidate = re.sub(r"\d+", " ", candidate)       # 去位置参数数字
+    candidate = candidate.replace("环境", " ")       # 「线上环境」里的「环境」不算业务词
+    candidate = re.sub(r"[\s，,。；;、:：.!！?？]+", "", candidate)
+    return not candidate
 
 
 def _conv_of(message) -> str:
@@ -127,7 +131,11 @@ def extract_env(text: str, default: str) -> tuple[str, str, bool]:
         return match.group(1).lower(), cleaned, True
     for word, env in _CN_ENV:
         if word in text:
-            return env, text.replace(word, " ").strip(), True
+            # 「线上环境」里的「环境」只是修饰语，留着会污染检索词
+            cleaned = text.replace(word, " ").replace("环境", " ")
+            # 只替换中文标点：英文逗号/分号可能是 /call 的 JSON 参数，不能动
+            cleaned = re.sub(r"[，、；]+", " ", cleaned)
+            return env, " ".join(cleaned.split()), True
     return default, text, False
 
 
@@ -363,6 +371,22 @@ class SearchFlow:
     # 对外入口
     # ------------------------------------------------------------------ #
 
+    async def _search_api(self, arguments: dict) -> tuple[str, bool]:
+        """调用 search_api；超时自动重试一次。
+
+        网关进程刚起来时首次检索要按需扫描索引，可能撞上 90s 超时；
+        此时索引已预热完成，重试通常几秒内返回，比直接回「网关调用失败」有用。
+        """
+        client: McpStdioClient = await self._client_provider()
+        try:
+            return await client.call_tool("search_api", arguments)
+        except McpGatewayError as exc:
+            if "超时" not in str(exc):
+                raise
+            logger.warning("search_api 超时，重试一次：%s", arguments)
+            client = await self._client_provider()
+            return await client.call_tool("search_api", arguments)
+
     async def begin_search(self, query: str, env: str, message, env_explicit: bool) -> str:
         """开始一轮新检索，覆盖该会话的旧状态。
 
@@ -374,9 +398,8 @@ class SearchFlow:
         返回: 第 1 组候选的 markdown 文本。
         """
         conv = _conv_of(message)
-        client: McpStdioClient = await self._client_provider()
-        raw, is_error = await client.call_tool(
-            "search_api", {"env": env, "query": query, "limit": POOL_LIMIT}
+        raw, is_error = await self._search_api(
+            {"env": env, "query": query, "limit": POOL_LIMIT}
         )
         if is_error:
             self._drop(conv)
@@ -453,9 +476,9 @@ class SearchFlow:
             self._save(conv, session)
             return reply
 
-        # 「换一组」之后是明确的选条阶段；补参数阶段不能再把纯数字当序号，
+        # 选条：列表阶段随时可选；补参数阶段只认带「第/选」字样的写法，
         # 否则「599602175」会被理解成「第 599602175 条」。
-        if session.stage == "list":
+        if session.stage == "list" or stripped.startswith(("第", "选")):
             pick = _parse_pick(stripped)
             if pick is not None and session.page:
                 reply = await self._pick(conv, session, pick)
@@ -512,15 +535,13 @@ class SearchFlow:
         """
         page_size = max(1, self._settings.search_limit)
         remaining = [it for it in session.pool if _item_key(it) not in session.shown]
-        client: McpStdioClient = await self._client_provider()
 
         session.refetched = len(remaining) < page_size and session.variant_index < len(QUERY_SUFFIXES)
         while len(remaining) < page_size and session.variant_index < len(QUERY_SUFFIXES):
             variant = session.query + QUERY_SUFFIXES[session.variant_index]
             session.variant_index += 1
-            raw, is_error = await client.call_tool(
-                "search_api",
-                {"env": session.search_env, "query": variant, "limit": POOL_LIMIT},
+            raw, is_error = await self._search_api(
+                {"env": session.search_env, "query": variant, "limit": POOL_LIMIT}
             )
             if is_error:
                 logger.warning("换组检索失败 conv=%s query=%r error=%s", conv, variant, raw[:200])

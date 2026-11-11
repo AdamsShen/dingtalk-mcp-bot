@@ -124,6 +124,8 @@ class GatewayBotHandler(ChatbotHandler):
         self.connection = connection
         self.ops = ops
         self.search_flow = search_flow
+        # 持有后台任务引用，避免事件循环把它当垃圾回收掉
+        self._background: set[asyncio.Task] = set()
 
     async def process(self, callback: dingtalk_stream.CallbackMessage):
         message = ChatbotMessage.from_dict(callback.data)
@@ -134,6 +136,15 @@ class GatewayBotHandler(ChatbotHandler):
             message.conversation_type,
             text[:120],
         )
+        # 先 ACK 再处理：检索偶尔超过钉钉的等待窗口（网关冷启动/索引预热可达 90s），
+        # 同步等待会让钉钉判定投递失败并重投，导致同一句话被处理两次、回两条结果。
+        task = asyncio.create_task(self._handle_and_reply(text, message))
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        return AckMessage.STATUS_OK, "OK"
+
+    async def _handle_and_reply(self, text: str, message: ChatbotMessage) -> None:
+        """后台处理一条消息并回帖；异常必须在这里兜住，不能静默丢消息。"""
         try:
             reply = await self._dispatch(text, message)
         except McpGatewayError as exc:
@@ -142,9 +153,7 @@ class GatewayBotHandler(ChatbotHandler):
         except Exception as exc:  # noqa: BLE001 - 机器人不能因为异常静默
             logger.exception("处理消息异常")
             reply = f"**处理异常**\n\n`{type(exc).__name__}: {exc}`"
-
         await self._reply(reply, message)
-        return AckMessage.STATUS_OK, "OK"
 
     # ------------------------------------------------------------------ #
 
