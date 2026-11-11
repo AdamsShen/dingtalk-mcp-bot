@@ -66,7 +66,25 @@ cp .env.example .env     # 然后填 DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET
 | `/call list_methods {"iface":"...","artifact_id":"standalone-pom"}` | 直接调用某个工具 |
 | `修改用户昵称`（不加指令） | 等同于 `/search 修改用户昵称` |
 
-环境也可以在任意消息里用 `env=test` / `--env test` 覆盖。
+### 检索后的多轮流程
+
+检索结果按会话保存（30 分钟有效），可以连续追问：
+
+| 你说 | 机器人动作 |
+|---|---|
+| `第2条` / `第4个方法` / `选 3` / `第二条` | 选定当前组的方法，回显参数类型与路由，提示补参数和环境 |
+| `换一组` / `换一组方法` / `下一组` | 换一批没展示过的候选；本轮候选用尽后会改写 query 重新做一次向量检索 |
+| `currentLoginedUid=586218703 env=test` | 按请求参数模板生成请求体预览 |
+| `确认` | 只读方法在放行 `invoke_rpc` 后执行；写方法一律不执行，提示走 IDE |
+| `取消` | 结束本次检索流程，不执行任何调用 |
+
+「换一组」的实现背景：mcp-gateway 的 `search_api` 只支持 `limit`（网关上限 10），
+没有 `offset` / `exclude`，所以一次取满候选池后本地分页展示；池用尽时用改写过的
+query 重新发起向量检索并按 `iface#method#artifact_id` 去重，保证换出来的是新候选。
+回帖会标注本组来源（「本轮检索候选」或「重新向量检索」）。
+
+环境也可以在任意消息里用 `env=test` / `--env test` 覆盖，检索和执行阶段都认中文
+「线上 / 生产 / 测试 / 预发」。执行环境必须显式指定，除非检索那句话里已经带过。
 
 ## 6. 安全边界
 
@@ -96,6 +114,7 @@ cp .env.example .env     # 然后填 DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET
 | `bot.py` | 钉钉 Stream 机器人 + 指令路由 |
 | `mcp_client.py` | 手写 MCP stdio 客户端（JSON-RPC 2.0，按行分隔） |
 | `config.py` | 环境变量配置 |
+| `search_flow.py` | 检索结果会话状态（第N条选择 / 换一组 / 补参数环境 / 请求体预览） |
 | `ops_actions.py` | ops-quick-actions 快捷 RPC 接入（意图识别 + plan→确认→run） |
 | `smoke_test.py` | 不依赖钉钉的链路自检 |
 
