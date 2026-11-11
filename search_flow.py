@@ -27,8 +27,9 @@ logger = logging.getLogger("dingtalk-mcp-bot.search")
 
 # 单次检索取满候选池；网关 max_search_results 当前为 10，取 10 不会超限
 POOL_LIMIT = 10
-# 会话有效期：群里多人共用会话，避免几小时前的「第2条」串到新对话
-SESSION_TTL_SECONDS = 1800.0
+# 会话有效期 2 小时（按最后一次交互滑动计时）：群里多人共用会话，
+# 保留足够长的追问窗口，同时避免隔夜的「第2条」串到新对话
+SESSION_TTL_SECONDS = 7200.0
 # 换组时改写 query 的后缀，按顺序轮转；仅当候选池用尽才触发新一轮向量检索
 QUERY_SUFFIXES = (" 接口", " 方法", " 服务", " 查询", " 获取", " 列表", " 详情")
 
