@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 logs/
 .DS_Store
+# 运行时数据：检索会话 SQLite
+data/

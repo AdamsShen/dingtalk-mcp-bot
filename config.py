@@ -43,6 +43,9 @@ class Settings:
     max_reply_chars: int = 3500
     log_level: str = "INFO"
 
+    # 检索会话持久化：SQLite 单文件，重启不丢（不需要按人隔离，仍按群会话）
+    session_db: str = str(BASE_DIR / "data" / "sessions.db")
+
     # ops-quick-actions：线上运营快捷 RPC（复用 actions.yaml 分发器）
     # 必须用系统 Python（含 PyYAML / certifi），项目虚拟环境没有这些依赖
     ops_dispatch_py: str = "/Library/git-root/thriftTester/mcp-gateway/.venv/bin/python"
@@ -114,6 +117,7 @@ def load_settings() -> Settings:
         call_timeout_seconds=float(_env("CALL_TIMEOUT_SECONDS", "90")),
         max_reply_chars=int(_env("MAX_REPLY_CHARS", "3500")),
         log_level=_env("LOG_LEVEL", "INFO").upper(),
+        session_db=_env("SESSION_DB", str(BASE_DIR / "data" / "sessions.db")),
         ops_dispatch_py=_env(
             "OPS_DISPATCH_PY",
             "/Library/git-root/thriftTester/mcp-gateway/.venv/bin/python",

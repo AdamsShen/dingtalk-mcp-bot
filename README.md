@@ -68,7 +68,9 @@ cp .env.example .env     # 然后填 DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET
 
 ### 检索后的多轮流程
 
-检索结果按会话保存（2 小时有效，按最后一次交互滑动计时），可以连续追问：
+检索结果按会话保存（2 小时有效，按最后一次交互滑动计时），落在本地 SQLite
+（默认 `data/sessions.db`，可用 `SESSION_DB` 覆盖），**机器人重启后仍能接着上一轮继续**。
+会话按群隔离（`conversation_id`），不按人区分。可以连续追问：
 
 | 你说 | 机器人动作 |
 |---|---|
@@ -114,7 +116,8 @@ query 重新发起向量检索并按 `iface#method#artifact_id` 去重，保证�
 | `bot.py` | 钉钉 Stream 机器人 + 指令路由 |
 | `mcp_client.py` | 手写 MCP stdio 客户端（JSON-RPC 2.0，按行分隔） |
 | `config.py` | 环境变量配置 |
-| `search_flow.py` | 检索结果会话状态（第N条选择 / 换一组 / 补参数环境 / 请求体预览） |
+| `search_flow.py` | 检索结果会话状态（第N条选择 / 换一组 / 补参数环境 / 请求体预览）；SQLite 持久化 |
+| `data/sessions.db` | 运行时自动生成，存检索会话状态（已 gitignore） |
 | `ops_actions.py` | ops-quick-actions 快捷 RPC 接入（意图识别 + plan→确认→run） |
 | `smoke_test.py` | 不依赖钉钉的链路自检 |
 

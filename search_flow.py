@@ -16,8 +16,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from config import Settings
@@ -188,10 +190,95 @@ class _Session:
     exec_env: str = ""
     # 用户分多轮给的参数要累积保存：只说环境、参数不全时不能把已收到的参数丢掉
     saved_kv: dict = field(default_factory=dict)
-    updated_at: float = field(default_factory=time.monotonic)
+    # 用 wall clock 而非 monotonic：要写入 SQLite 并在进程重启后继续比较
+    updated_at: float = field(default_factory=time.time)
 
     def touch(self) -> None:
-        self.updated_at = time.monotonic()
+        self.updated_at = time.time()
+
+
+class SessionStore:
+    """检索会话的 SQLite 持久化。
+
+    只存「这个群当前进行到哪一步」的会话状态，不存聊天记录。
+    key 仍是 conversation_id（不按人隔离），重启后能接着上一轮继续追问。
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        db_path = Path(path).expanduser()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        # check_same_thread=False：检索流程在线程池里跑 dispatch 子进程，
+        # 连接会跨线程被访问；SQLite 单写者 + WAL 足够应对当前并发量。
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS search_sessions (
+                conversation_id TEXT PRIMARY KEY,
+                payload         TEXT NOT NULL,
+                updated_at      REAL NOT NULL
+            )
+            """
+        )
+        self._conn.commit()
+        # 启动时清一次过期会话，避免文件无限增长
+        self.purge_expired(SESSION_TTL_SECONDS)
+        logger.info("会话库就绪：%s", db_path)
+
+    def load(self, conversation_id: str, ttl: float) -> Optional[_Session]:
+        """按会话读回状态；不存在或已过期返回 None（过期行顺手删掉）。"""
+        row = self._conn.execute(
+            "SELECT payload, updated_at FROM search_sessions WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        payload, updated_at = row
+        if time.time() - float(updated_at) > ttl:
+            self.delete(conversation_id)
+            logger.info("会话已过期并从库中清理 conv=%s", conversation_id)
+            return None
+        try:
+            data = json.loads(payload)
+        except (TypeError, ValueError):
+            logger.warning("会话数据损坏，已丢弃 conv=%s", conversation_id)
+            self.delete(conversation_id)
+            return None
+        data["shown"] = set(data.get("shown") or [])
+        return _Session(**data)
+
+    def save(self, conversation_id: str, session: _Session) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO search_sessions (conversation_id, payload, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(conversation_id) DO UPDATE SET
+                payload = excluded.payload,
+                updated_at = excluded.updated_at
+            """,
+            (conversation_id, _serialize(session), session.updated_at),
+        )
+        self._conn.commit()
+
+    def delete(self, conversation_id: str) -> None:
+        self._conn.execute(
+            "DELETE FROM search_sessions WHERE conversation_id = ?", (conversation_id,)
+        )
+        self._conn.commit()
+
+    def purge_expired(self, ttl: float) -> int:
+        cursor = self._conn.execute(
+            "DELETE FROM search_sessions WHERE updated_at < ?", (time.time() - ttl,)
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
+
+def _serialize(session: _Session) -> str:
+    """序列化会话；shown 是 set，JSON 不支持，转成有序 list 便于 diff。"""
+    data = asdict(session)
+    data["shown"] = sorted(session.shown)
+    return json.dumps(data, ensure_ascii=False)
 
 
 def _render_invoke_result(item: dict, env: str, raw: str, is_error: bool) -> str:
@@ -247,7 +334,30 @@ class SearchFlow:
     def __init__(self, settings: Settings, client_provider) -> None:
         self._settings = settings
         self._client_provider = client_provider
+        # 进程内缓存 + SQLite 写穿：读命中缓存，写同时落库，重启后可恢复
         self._sessions: dict[str, _Session] = {}
+        self._store = SessionStore(settings.session_db)
+
+    def _get(self, conversation_id: str) -> Optional[_Session]:
+        """取会话：先看进程缓存，未命中再回落到 SQLite。"""
+        session = self._sessions.get(conversation_id)
+        if session is not None and time.time() - session.updated_at <= SESSION_TTL_SECONDS:
+            return session
+        if session is not None:
+            self._drop(conversation_id)
+        session = self._store.load(conversation_id, SESSION_TTL_SECONDS)
+        if session is not None:
+            self._sessions[conversation_id] = session
+        return session
+
+    def _save(self, conversation_id: str, session: _Session) -> None:
+        session.touch()
+        self._sessions[conversation_id] = session
+        self._store.save(conversation_id, session)
+
+    def _drop(self, conversation_id: str) -> None:
+        self._sessions.pop(conversation_id, None)
+        self._store.delete(conversation_id)
 
     # ------------------------------------------------------------------ #
     # 对外入口
@@ -269,25 +379,27 @@ class SearchFlow:
             "search_api", {"env": env, "query": query, "limit": POOL_LIMIT}
         )
         if is_error:
-            self._sessions.pop(conv, None)
+            self._drop(conv)
             return f"**检索失败**（env=`{env}`）\n\n```text\n{raw}\n```"
 
         try:
             data = json.loads(raw)
         except (TypeError, ValueError):
-            self._sessions.pop(conv, None)
+            self._drop(conv)
             return f"**检索：{query}**（env=`{env}`）\n\n```text\n{raw}\n```"
         if isinstance(data, dict) and data.get("ok") is False:
-            self._sessions.pop(conv, None)
+            self._drop(conv)
             return f"检索失败：{data.get('error') or data}"
 
         results = (data.get("results") if isinstance(data, dict) else None) or []
         session = _Session(query=query, search_env=env, env_explicit=env_explicit, pool=list(results))
-        self._sessions[conv] = session
         logger.info(
             "新检索 conv=%s query=%r env=%s 候选=%d", conv, query, env, len(results)
         )
-        return self._fill_page(session)
+        text = self._fill_page(session)
+        # 新会话落库，重启后仍能接着选第 N 条
+        self._save(conv, session)
+        return text
 
     @staticmethod
     def is_confirm_word(text: str) -> bool:
@@ -295,12 +407,8 @@ class SearchFlow:
         return (text or "").strip().lower() in _CONFIRM_WORDS
 
     def has_session(self, message) -> bool:
-        """当前会话是否还有未结束的检索流程。"""
-        session = self._sessions.get(_conv_of(message))
-        return (
-            session is not None
-            and time.monotonic() - session.updated_at <= SESSION_TTL_SECONDS
-        )
+        """当前会话是否还有未结束的检索流程（含从 SQLite 恢复的会话）。"""
+        return self._get(_conv_of(message)) is not None
 
     def wants_confirm(self, text: str, message) -> bool:
         """预览阶段的「确认」是否必须交给检索流程处理。
@@ -309,12 +417,11 @@ class SearchFlow:
         用户本意是确认请求体预览，却会误触发写操作。故检索流程处于 preview 时
         由 bot 在 ops 之前优先拦截确认词。
         """
-        session = self._sessions.get(_conv_of(message))
+        session = self._get(_conv_of(message))
         return (
             session is not None
             and session.stage == "preview"
             and (text or "").strip().lower() in _CONFIRM_WORDS
-            and time.monotonic() - session.updated_at <= SESSION_TTL_SECONDS
         )
 
     async def maybe_handle(
@@ -329,44 +436,45 @@ class SearchFlow:
         返回 None 表示「当普通检索处理」；返回字符串表示已处理完，直接回帖。
         """
         conv = _conv_of(message)
-        session = self._sessions.get(conv)
+        # 先走缓存，未命中从 SQLite 恢复：重启后仍可接着上一轮继续
+        session = self._get(conv)
         if session is None:
-            return None
-        if time.monotonic() - session.updated_at > SESSION_TTL_SECONDS:
-            self._sessions.pop(conv, None)
-            logger.info("检索会话过期 conv=%s", conv)
             return None
 
         stripped = (text or "").strip()
         lowered = stripped.lower()
 
         if lowered in _CANCEL_WORDS:
-            self._sessions.pop(conv, None)
+            self._drop(conv)
             return "已取消本次检索流程，未执行任何调用。"
 
         if lowered in _NEXT_WORDS:
-            session.touch()
-            return await self._next_group(conv, session)
+            reply = await self._next_group(conv, session)
+            self._save(conv, session)
+            return reply
 
         # 「换一组」之后是明确的选条阶段；补参数阶段不能再把纯数字当序号，
         # 否则「599602175」会被理解成「第 599602175 条」。
         if session.stage == "list":
             pick = _parse_pick(stripped)
             if pick is not None and session.page:
-                session.touch()
-                return await self._pick(conv, session, pick)
+                reply = await self._pick(conv, session, pick)
+                self._save(conv, session)
+                return reply
 
         # 确认词只要会话还在就接管：参数没补齐时给出引导，不能掉回检索把状态冲掉
         if lowered in _CONFIRM_WORDS:
-            session.touch()
             if session.stage == "preview":
                 return await self._confirm(conv, session)
+            session.touch()
+            self._save(conv, session)
             return "当前还没有可确认的请求体。请先回复 **第N条**，再补齐参数和环境。"
 
         # 补参数阶段：含 k=v、只补环境、或纯数字位置参数都留在会话里累计
         if allow_params and session.stage in {"params", "preview"} and _looks_like_params(stripped):
-            session.touch()
-            return await self._preview(conv, session, stripped)
+            reply = await self._preview(conv, session, stripped)
+            self._save(conv, session)
+            return reply
 
         # 其余文本（含新的业务关键词）交给主路由重新检索，旧会话会被 begin_search 覆盖
         return None
@@ -673,7 +781,7 @@ class SearchFlow:
         if describe.get("confirm_token"):
             arguments["confirm_token"] = describe["confirm_token"]
         raw, is_error = await client.call_tool("invoke_rpc", arguments)
-        self._sessions.pop(conv, None)
+        self._drop(conv)
         logger.info(
             "确认调用 conv=%s method=%s env=%s isError=%s",
             conv, item.get("method"), session.exec_env, is_error,
