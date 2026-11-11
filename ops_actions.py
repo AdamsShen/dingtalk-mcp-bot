@@ -161,13 +161,17 @@ class OpsDispatcher:
         return self._aliases is not None
 
     def match_alias(self, text: str) -> Optional[str]:
-        """文本中出现某个操作别名（大小写不敏感）时返回操作 key。"""
+        """文本中出现某个操作别名（大小写不敏感）时返回操作 key。
+
+        按别名长度倒序匹配：短别名（如「认证」）是长别名（如「查询认证信息」）
+        的子串，按插入顺序会先命中，导致查询请求被当成认证写操作。
+        """
         if not self._aliases:
             return None
         lowered = text.lower()
-        for alias, key in self._aliases.items():
+        for alias in sorted(self._aliases, key=len, reverse=True):
             if alias and alias in lowered:
-                return key
+                return self._aliases[alias]
         return None
 
     def action_meta(self, key: str) -> dict:
@@ -392,6 +396,13 @@ class OpsRouter:
             conv,
         )
 
+        # read 类没有副作用，免二次确认：plan 后直接执行，少一轮交互
+        if risk == "read":
+            return await self._exec(
+                data["action"], data["env"], data["variables"],
+                data.get("confirm_token", ""), conv,
+            )
+
         self._pending[conv] = PendingPlan(
             action=data["action"],
             env=data["env"],
@@ -421,20 +432,26 @@ class OpsRouter:
 
         http = data.get("http_status")
         success = data.get("success")
+        # 有的接口不返回 success，只用业务码 retCode；此时不能一律判失败
+        result = data.get("result") if isinstance(data.get("result"), dict) else {}
+        ret_code = result.get("retCode")
+        ok = success is True or (success is None and ret_code in (0, None) and http == 200)
         logger.info(
-            "ops run action=%s env=%s http=%s success=%s conv=%s",
+            "ops run action=%s env=%s http=%s success=%s retCode=%s conv=%s",
             action,
             env,
             http,
             success,
+            ret_code,
             conv,
         )
-        if success is not True:
+        if not ok:
             logger.warning(
-                "ops run 未成功 action=%s env=%s http=%s errorCode=%s errorMsg=%s",
+                "ops run 未成功 action=%s env=%s http=%s retCode=%s errorCode=%s errorMsg=%s",
                 action,
                 env,
                 http,
+                ret_code,
                 data.get("errorCode"),
                 data.get("errorMsg"),
             )
@@ -460,10 +477,16 @@ class OpsRouter:
 
     @staticmethod
     def _render_run(data: dict) -> str:
+        result = data.get("result") if isinstance(data.get("result"), dict) else {}
+        if data.get("success") is not None:
+            status = f"success=`{data['success']}`"
+        elif result.get("retCode") is not None:
+            status = f"retCode=`{result['retCode']}`"
+        else:
+            status = "success=`-`"
         lines = [
             f"**ops 执行结果：`{data['action']}`**（env=`{data['env']}`）",
-            f"- HTTP：`{data['http_status']}`　耗时：`{data['duration_ms']}ms`",
-            f"- success：`{data['success']}`",
+            f"- HTTP：`{data['http_status']}`　耗时：`{data['duration_ms']}ms`　{status}",
         ]
         if data.get("errorCode") not in (None, 0):
             lines.append(f"- errorCode：`{data['errorCode']}`")
