@@ -43,8 +43,13 @@ _NEXT_WORDS = {
     "换一组", "换一组方法", "换一批", "换一批方法", "下一组", "下一页",
     "再来一组", "看看别的", "换", "more", "next",
 }
-_CANCEL_WORDS = {"取消", "取消操作", "放弃", "算了", "cancel"}
-_CONFIRM_WORDS = {"确认", "确认执行", "执行", "可以", "ok", "yes", "run"}
+_CANCEL_WORDS = {"取消", "取消操作", "放弃", "算了", "cancel", "不用了"}
+# 群里实际会说的确认话术都比「确认」随意，收全一点，避免掉回检索
+_CONFIRM_WORDS = {
+    "确认", "确认执行", "确定", "确定执行", "执行", "可以", "好的", "好",
+    "行", "是", "嗯", "对", "没问题", "开始", "发起", "调用",
+    "ok", "okay", "yes", "y", "run", "go",
+}
 
 # 与 ops_actions.py 的中文环境词规则保持一致；执行环境必须由用户显式指定
 _CN_ENV = (
@@ -188,6 +193,53 @@ class _Session:
         self.updated_at = time.monotonic()
 
 
+def _render_invoke_result(item: dict, env: str, raw: str, is_error: bool) -> str:
+    """渲染 invoke_rpc 结果。
+
+    网关把业务返回再包了一层：外层是调用元信息，``result`` 往往还是 JSON 字符串，
+    里面的 ``content`` 又是 JSON。直接贴原文群里只能看到一堆反斜杠转义，
+    这里逐层解开后按缩进展示，只保留业务数据本身。
+    """
+    header = "调用失败" if is_error else "调用完成"
+    lines = [f"**{header}：`{item.get('method')}`**（env=`{env}`）"]
+    try:
+        outer = json.loads(raw)
+    except (TypeError, ValueError):
+        return f"{lines[0]}\n\n```text\n{raw}\n```"
+    if not isinstance(outer, dict):
+        return f"{lines[0]}\n\n```json\n{json.dumps(outer, ensure_ascii=False, indent=2)}\n```"
+
+    if outer.get("ok") is False or is_error:
+        lines.append(f"- ok：`{outer.get('ok')}`")
+        error = outer.get("error") or outer.get("errorMsg")
+        if error:
+            lines.append(f"- error：`{error}`")
+
+    payload = outer.get("result")
+    # result 是 JSON 字符串时先解开，再尝试解开其中的 content
+    for _ in range(2):
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+                continue
+            except (TypeError, ValueError):
+                break
+        break
+    if isinstance(payload, dict) and isinstance(payload.get("content"), str):
+        try:
+            payload["content"] = json.loads(payload["content"])
+        except (TypeError, ValueError):
+            pass
+
+    if payload is None:
+        return "\n".join(lines)
+    lines.append("")
+    lines.append("```json")
+    lines.append(json.dumps(payload, ensure_ascii=False, indent=2))
+    lines.append("```")
+    return "\n".join(lines)
+
+
 class SearchFlow:
     """管理「检索 → 选第 N 条 → 补参数/环境 → 预览 → 确认」的会话状态。"""
 
@@ -235,6 +287,19 @@ class SearchFlow:
             "新检索 conv=%s query=%r env=%s 候选=%d", conv, query, env, len(results)
         )
         return self._fill_page(session)
+
+    @staticmethod
+    def is_confirm_word(text: str) -> bool:
+        """判断是否为确认类话术，供机器人区分「确认」和普通检索词。"""
+        return (text or "").strip().lower() in _CONFIRM_WORDS
+
+    def has_session(self, message) -> bool:
+        """当前会话是否还有未结束的检索流程。"""
+        session = self._sessions.get(_conv_of(message))
+        return (
+            session is not None
+            and time.monotonic() - session.updated_at <= SESSION_TTL_SECONDS
+        )
 
     def wants_confirm(self, text: str, message) -> bool:
         """预览阶段的「确认」是否必须交给检索流程处理。
@@ -590,20 +655,26 @@ class SearchFlow:
             )
 
         client: McpStdioClient = await self._client_provider()
+        describe = session.describe or {}
         arguments = {
             "env": session.exec_env,
-            "application": item.get("application", ""),
-            "artifact_id": item.get("artifact_id", ""),
-            "iface": item.get("iface", ""),
-            "method": item.get("method", ""),
-            "req_param": session.request_body,
+            "application": item.get("application", "") or "",
+            "artifact_id": item.get("artifact_id", "") or "",
+            "iface": item.get("iface", "") or "",
+            "method": item.get("method", "") or "",
+            # 网关工具层把 req_param 声明为 JSON 字符串，传 dict 会被 pydantic 拒绝
+            "req_param": json.dumps(session.request_body or {}, ensure_ascii=False),
             "user_confirmed": True,
+            # 明确带上路由，避免同名方法在多个 group 下被网关判为歧义
+            "group": describe.get("group") or "",
+            "scope": describe.get("scope") or "",
         }
+        if describe.get("confirm_token"):
+            arguments["confirm_token"] = describe["confirm_token"]
         raw, is_error = await client.call_tool("invoke_rpc", arguments)
         self._sessions.pop(conv, None)
         logger.info(
             "确认调用 conv=%s method=%s env=%s isError=%s",
             conv, item.get("method"), session.exec_env, is_error,
         )
-        header = "调用失败" if is_error else "调用完成"
-        return f"**{header}：`{item.get('method')}`**（env=`{session.exec_env}`）\n\n```json\n{raw}\n```"
+        return _render_invoke_result(item, session.exec_env, raw, is_error)

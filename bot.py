@@ -190,6 +190,13 @@ class GatewayBotHandler(ChatbotHandler):
         if flow_reply is not None:
             return flow_reply
 
+        # 没有活跃会话时回「确定」这类词，给一句明确提示，别当检索词乱搜
+        if self.search_flow.is_confirm_word(text) and not self.search_flow.has_session(message):
+            return (
+                "当前没有待确认的操作。\n"
+                "先 @我 说一句话检索接口（例如「查询用户信息」），选好第几条并补完参数环境后再确认。"
+            )
+
         # 没写指令：当成检索词，同时建立一轮可继续追问的检索会话
         reply = await self._search(text, env, message, env_explicit)
         if fallback_hint:
