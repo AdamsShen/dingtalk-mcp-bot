@@ -52,7 +52,29 @@ _CN_ENV = (
     ("测试", "test"), ("预发", "test"), ("预发布", "test"),
 )
 _ENV_RE = re.compile(r"(?:^|\s)(?:--env[=\s]+|env=)(test|product)(?=\s|$)", re.IGNORECASE)
-_KV_RE = re.compile(r"([A-Za-z_]\w*)\s*=\s*(\S+)")
+_KV_RE = re.compile(r"([A-Za-z_]\w*)\s*=\s*([^\s，,；;、]+)")
+# 位置参数：纯数字且不在 k=v 里（排除 operId=11932 这类显式值），用于「599602175 查询」写法
+_POSITIONAL_NUM_RE = re.compile(r"(?<![\w=])(\d{4,20})(?![\w])")
+# 中文数字与标点混排的分隔，便于从自由文本里提取参数
+_SEP_RE = re.compile(r"[，,；;、\s]+")
+
+
+def _looks_like_params(text: str) -> bool:
+    """判断一条消息是否在补请求参数。
+
+    用户常见写法有三种：``uid=1``、``线上环境``（只补环境）、``599602175 查询``
+    （位置参数）。只要是这几种就应留在当前会话里，不能被当成新的检索词——
+    否则会话会被重建，用户前面给的参数全部丢失。
+    """
+    candidate = (text or "").strip()
+    if not candidate:
+        return False
+    if "=" in candidate:
+        return True
+    if _parse_env(candidate):
+        return True
+    # 纯数字（可带中文标点分隔）视为可能的 uid / roomId 等位置参数
+    return bool(re.fullmatch(r"[\d，,；;、\s]+", candidate))
 
 
 def _conv_of(message) -> str:
@@ -114,6 +136,17 @@ def _strip_env_words(text: str) -> str:
     return cleaned.strip()
 
 
+def _is_numeric_type(type_name: Optional[str]) -> bool:
+    """判断 thrift 参数是否为整数/浮点类型，用于位置参数只填数字字段。"""
+    lowered = str(type_name or "").lower()
+    return any(token in lowered for token in ("i8", "i16", "i32", "i64", "int", "long", "double", "float"))
+
+
+def _is_bool_type(type_name: Optional[str]) -> bool:
+    """bool 参数有模板默认值，缺省时沿用模板，不要求用户显式提供。"""
+    return "bool" in str(type_name or "").lower()
+
+
 def _coerce(raw: str, existing) -> object:
     """按 request_param_template 里的占位类型把字符串转成正确类型。"""
     if isinstance(existing, bool):
@@ -147,6 +180,8 @@ class _Session:
     describe: Optional[dict] = None
     request_body: Optional[dict] = None
     exec_env: str = ""
+    # 用户分多轮给的参数要累积保存：只说环境、参数不全时不能把已收到的参数丢掉
+    saved_kv: dict = field(default_factory=dict)
     updated_at: float = field(default_factory=time.monotonic)
 
     def touch(self) -> None:
@@ -247,10 +282,13 @@ class SearchFlow:
             session.touch()
             return await self._next_group(conv, session)
 
-        pick = _parse_pick(stripped)
-        if pick is not None and session.page:
-            session.touch()
-            return await self._pick(conv, session, pick)
+        # 「换一组」之后是明确的选条阶段；补参数阶段不能再把纯数字当序号，
+        # 否则「599602175」会被理解成「第 599602175 条」。
+        if session.stage == "list":
+            pick = _parse_pick(stripped)
+            if pick is not None and session.page:
+                session.touch()
+                return await self._pick(conv, session, pick)
 
         # 确认词只要会话还在就接管：参数没补齐时给出引导，不能掉回检索把状态冲掉
         if lowered in _CONFIRM_WORDS:
@@ -259,7 +297,8 @@ class SearchFlow:
                 return await self._confirm(conv, session)
             return "当前还没有可确认的请求体。请先回复 **第N条**，再补齐参数和环境。"
 
-        if allow_params and session.stage in {"params", "preview"} and "=" in stripped:
+        # 补参数阶段：含 k=v、只补环境、或纯数字位置参数都留在会话里累计
+        if allow_params and session.stage in {"params", "preview"} and _looks_like_params(stripped):
             session.touch()
             return await self._preview(conv, session, stripped)
 
@@ -288,6 +327,7 @@ class SearchFlow:
         session.picked_index = 0
         session.describe = None
         session.request_body = None
+        session.saved_kv = {}
         return self._render_page(session)
 
     async def _next_group(self, conv: str, session: _Session) -> str:
@@ -445,6 +485,8 @@ class SearchFlow:
         session.picked_index = index
         session.describe = describe
         session.stage = "params"
+        # 换了一条方法就重置参数，避免把上一条的参数带进来
+        session.saved_kv = {}
         logger.info(
             "选定候选 conv=%s index=%d iface=%s method=%s",
             conv, index, item.get("iface"), item.get("method"),
@@ -454,21 +496,47 @@ class SearchFlow:
         )
 
     async def _preview(self, conv: str, session: _Session, text: str) -> str:
-        """解析 k=v 与显式环境，套用 request_param_template 生成请求体。"""
+        """解析 k=v / 位置参数与显式环境，套用 request_param_template 生成请求体。
+
+        参数分多轮给也要能累积：先合并历史 ``saved_kv``，再解析本条消息。
+        缺环境时先保存参数再提示，否则用户补一句「线上」，前面的参数会丢。
+        """
         if session.picked is None or session.describe is None:
             return "请先回复 **第N条** 选定方法。"
+
+        work = _strip_env_words(text)
+        kv = dict(session.saved_kv)
+        for match in _KV_RE.finditer(work):
+            kv[match.group(1)] = match.group(2)
+
+        # 位置参数：用户常写「599602175， operId=11932」，孤立数字按字段顺序补
+        # 只填数字类型的未填字段，避免把 uid 塞进 bool/struct 参数里。
+        params = session.describe.get("param_fields") or []
+        if isinstance(params, str):
+            params = [p.strip() for p in params.split(",") if p.strip()]
+        types = session.describe.get("param_types") or {}
+
+        positional = _POSITIONAL_NUM_RE.findall(_KV_RE.sub(" ", work))
+        if positional:
+            numeric_fields = [
+                p for p in params
+                if p not in kv and _is_numeric_type(types.get(p))
+            ]
+            for field, value in zip(numeric_fields, positional):
+                kv[field] = value
+
+        session.saved_kv = kv
 
         env = _parse_env(text)
         if env is None:
             env = session.search_env if session.env_explicit else ""
         if not env:
+            received = json.dumps(kv, ensure_ascii=False) if kv else "（无）"
             return (
-                "还缺**环境**。请回复参数并指定环境，例如：\n"
-                "`uid=586218703 env=test`（线上用 `env=product`，也可说「线上」「测试」）。"
+                f"还缺**环境**。已收到参数 {received}，请再补一句环境即可，例如：\n"
+                "`env=product` / `env=test`，或直接说「线上」「测试」。"
             )
 
-        kv = {m.group(1): m.group(2).rstrip("，。；、,.;：:")
-              for m in _KV_RE.finditer(_strip_env_words(text))}
         try:
             template = json.loads(session.describe.get("request_param_template") or "{}")
         except (TypeError, ValueError):
@@ -476,7 +544,11 @@ class SearchFlow:
         if not isinstance(template, dict):
             template = {}
 
-        missing = [k for k in template if k not in kv]
+        # bool 参数在模板里有默认值（通常是 false），不该强迫运营每次手写
+        missing = [
+            k for k in template
+            if k not in kv and not _is_bool_type(types.get(k))
+        ]
         if missing:
             return f"还缺参数：`{'、'.join(missing)}`。请补全后重新发一次。"
 
