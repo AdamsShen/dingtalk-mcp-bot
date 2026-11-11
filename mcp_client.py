@@ -62,6 +62,9 @@ class McpStdioClient:
             return
 
         logger.info("启动 mcp-gateway：%s %s", self._command, " ".join(self._args))
+        # 默认 StreamReader 行上限 64KB；search_api 一次取 10 条候选时单行 JSON-RPC
+        # 会超过它并抛 ValueError('Separator is found, but chunk is longer than limit')，
+        # 读管道随之崩掉、请求只能等超时。这里按网关 max_response_bytes 留足余量。
         self._proc = await asyncio.create_subprocess_exec(
             self._command,
             *self._args,
@@ -69,6 +72,7 @@ class McpStdioClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=self._env,
+            limit=2 * 1024 * 1024,
         )
         self._closed = False
         self._reader = asyncio.create_task(self._read_stdout())
