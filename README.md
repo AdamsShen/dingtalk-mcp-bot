@@ -103,6 +103,7 @@ query 重新发起向量检索并按 `iface#method#artifact_id` 去重，保证�
 | 现象 | 原因 / 处理 |
 |---|---|
 | 启动报 `缺少钉钉凭据` | `.env` 没填或没复制成功 |
+| 群里 @机器人 毫无反应，日志狂刷 `connecting through a SOCKS proxy requires python-socks` | 系统开了 SOCKS 代理（如 Clash 7897），`websockets>=15` 默认走代理。程序已强制 WebSocket 直连；若仍出现，检查是否被别处覆盖 |
 | 群里 @机器人 无反应 | 机器人「消息接收模式」不是 Stream；或应用未发布/未加进群 |
 | 回帖「网关调用失败：mcp-gateway 未运行」 | `GATEWAY_BIN` 路径不对，或该虚拟环境缺少依赖 |
 | `env` 相关报错 | 网关强制要求显式 env，用 `env=test` / `env=product` 指定 |

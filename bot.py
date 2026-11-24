@@ -13,6 +13,7 @@ import os
 import ssl
 import sys
 
+import websockets
 import dingtalk_stream
 from dingtalk_stream import AckMessage, ChatbotHandler, ChatbotMessage
 
@@ -42,6 +43,27 @@ HELP_TEXT = """**mcp-gateway 机器人使用说明**
 或说「给 uid 123 主播认证」这类话术触发 ops 快捷操作。
 写操作（invoke_rpc）默认关闭，且写方法一律不自动执行，需要网关侧
 confirm_token 的流程请走 IDE。"""
+
+
+def _disable_ws_proxy() -> None:
+    """让钉钉 Stream 的 WebSocket 直连，绕过系统代理。
+
+    websockets>=15 的 connect() 默认 proxy=True，会读取系统代理；macOS 上开了
+    SOCKS 代理（如 Clash 的 127.0.0.1:7897）时会要求 python-socks，未安装就在
+    每次建连抛 ImportError，表现为机器人无限重连、群里完全收不到消息。
+    钉钉是国内服务，直连更稳，这里强制 proxy=None。
+    """
+    original = websockets.connect
+    if getattr(original, "_no_proxy_patched", False):
+        return
+
+    def connect_no_proxy(*args, **kwargs):
+        kwargs.setdefault("proxy", None)
+        return original(*args, **kwargs)
+
+    connect_no_proxy._no_proxy_patched = True  # type: ignore[attr-defined]
+    websockets.connect = connect_no_proxy  # type: ignore[assignment]
+    logger.info("WebSocket 已强制直连（忽略系统代理）")
 
 
 def _ensure_tls_ca() -> None:
@@ -283,6 +305,7 @@ def main() -> int:
     )
     settings.require_credentials()
     _ensure_tls_ca()
+    _disable_ws_proxy()
 
     # ops 快捷操作：用系统 Python 调 dispatch.py，启动时加载一次别名表
     allowed = {s.strip() for s in settings.ops_allowed_senders.split(",") if s.strip()}
