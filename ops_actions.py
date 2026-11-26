@@ -15,10 +15,13 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import logging
+import math
 import re
 import subprocess
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -121,6 +124,8 @@ class OpsDispatcher:
         # alias(lower) -> action key；以及 action key -> 元信息（require/risk/desc/aliases）
         self._aliases: Optional[dict] = None
         self._meta: dict = {}
+        self._vectors: dict[str, list[float]] = {}
+        self._index_lock = threading.Lock()
 
     def load_aliases(self) -> None:
         """启动期加载一次别名表（单一事实源 = dispatch.py list --json）。
@@ -177,6 +182,59 @@ class OpsDispatcher:
     def action_meta(self, key: str) -> dict:
         return self._meta.get(key, {})
 
+    @staticmethod
+    def _embed(texts: list[str]) -> list[list[float]]:
+        conn = http.client.HTTPConnection("127.0.0.1", 11434, timeout=8)
+        try:
+            conn.request(
+                "POST", "/api/embed",
+                json.dumps({"model": "bge-m3", "input": texts}),
+                {"Content-Type": "application/json"},
+            )
+            response = conn.getresponse()
+            if response.status != 200:
+                raise ValueError(f"Ollama HTTP {response.status}")
+            vectors = json.load(response)["embeddings"]
+        finally:
+            conn.close()
+
+        if len(vectors) != len(texts):
+            raise ValueError("Ollama 返回的向量数量不符")
+        normalized = []
+        for vector in vectors:
+            norm = math.hypot(*vector)
+            if not norm or not math.isfinite(norm) or len(vector) != len(vectors[0]):
+                raise ValueError("Ollama 返回了无效向量")
+            normalized.append([value / norm for value in vector])
+        return normalized
+
+    def match_semantic(self, text: str) -> Optional[str]:
+        if not self._meta:
+            return None
+        try:
+            with self._index_lock:
+                index = self._vectors
+                if not index:
+                    docs = [meta["desc"] or key for key, meta in self._meta.items()]
+                    *vectors, query = self._embed([*docs, text])
+                    index = self._vectors = dict(zip(self._meta, vectors))
+                else:
+                    query = None
+            if query is None:
+                query, = self._embed([text])
+            scores = sorted(
+                (sum(a * b for a, b in zip(query, vector, strict=True)), key)
+                for key, vector in index.items()
+            )
+        except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError) as exc:
+            logger.warning("ops 本地向量检索失败：%s", type(exc).__name__)
+            return None
+
+        score, key = scores[-1]
+        if score < 0.79 or (len(scores) > 1 and score - scores[-2][0] < 0.05):
+            return None
+        return key
+
     # ───────────── 底层同步调用（由上层用 to_thread 包成异步） ─────────────
 
     def _run(self, args: list[str], timeout: float = DISPATCH_TIMEOUT):
@@ -207,6 +265,18 @@ class OpsRouter:
 
     def _sender_ids(self, message) -> set[str]:
         return {getattr(message, "sender_id", None), getattr(message, "sender_staff_id", None)} - {None}
+
+    async def suggest(self, text: str, env: str) -> Optional[str]:
+        query = re.sub(r"[\d-]+", " ", _KV_RE.sub(" ", text)).strip()
+        if not query:
+            return None
+        key = await asyncio.to_thread(self._d.match_semantic, query)
+        if key is None:
+            return None
+        meta = self._d.action_meta(key)
+        params = [f"{field}=..." for field in meta["require"]]
+        command = " ".join(["/ops", key, *params, "--env", env])
+        return f"可能相关的快捷操作 **{meta['desc'] or key}**。如需使用，请填写参数后发送：\n\n`{command}`"
 
     async def maybe_handle(self, text: str, message) -> OpsOutcome:
         """优先按 ops 快捷操作处理；不是 ops 意图则返回空 outcome 让调用方走检索。"""
